@@ -37,6 +37,7 @@ public sealed class BluetoothDeviceEntry
     public string Name { get; init; } = "Unknown Device";
     public uint ClassOfDevice { get; init; }
     public bool IsConnected { get; init; }
+    public int? BatteryPercent { get; init; }
     public bool IsDefaultGamepad
     {
         get
@@ -55,11 +56,16 @@ public sealed class TrayAppContext : ApplicationContext
 
     private readonly NotifyIcon _trayIcon;
     private readonly RawInputListener _listener;
-    private readonly Timer _checkTimer;
+    private readonly Timer _tickTimer;
     private readonly string _settingsPath;
     private AppSettings _settings;
 
     private readonly Dictionary<string, DateTime> _deviceLastInput = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _hidBatteryCache = new(StringComparer.OrdinalIgnoreCase);
+    private int? _fallbackSinglePadBattery;
+    private List<BluetoothDeviceEntry> _cachedConnectedManaged = new();
+    private DateTime _lastBtScanUtc = DateTime.MinValue;
+    private uint _lastXInputPacketSum;
 
     public TrayAppContext()
     {
@@ -70,7 +76,7 @@ public sealed class TrayAppContext : ApplicationContext
         _settingsPath = Path.Combine(appDir, "settings.json");
         _settings = LoadSettings();
 
-        _listener = new RawInputListener(OnControllerInput);
+        _listener = new RawInputListener(OnControllerInput, OnControllerBattery);
 
         _trayIcon = new NotifyIcon { Visible = true };
 
@@ -81,18 +87,44 @@ public sealed class TrayAppContext : ApplicationContext
         PopulateMenu(menu);
         UpdateTrayVisuals();
 
-        _checkTimer = new Timer { Interval = 5_000 }; // Check every 5 seconds
-        _checkTimer.Tick += (_, _) => CheckIdle();
-        _checkTimer.Start();
+        _tickTimer = new Timer { Interval = 1_000 };
+        _tickTimer.Tick += (_, _) => OnTick();
+        _tickTimer.Start();
     }
 
     private void OnControllerInput(string? btAddressHex)
     {
-        // Only track Bluetooth devices; ignore wired/USB devices like sim racing wheelbases
+        DateTime now = DateTime.UtcNow;
+
+        if (!string.IsNullOrEmpty(btAddressHex) && _deviceLastInput.ContainsKey(btAddressHex))
+        {
+            _deviceLastInput[btAddressHex] = now;
+        }
+        else
+        {
+            foreach (var dev in _cachedConnectedManaged)
+            {
+                _deviceLastInput[dev.AddressHex] = now;
+            }
+        }
+    }
+
+    private void OnControllerBattery(string? btAddressHex, int percent)
+    {
         if (!string.IsNullOrEmpty(btAddressHex))
         {
-            _deviceLastInput[btAddressHex] = DateTime.UtcNow;
+            _hidBatteryCache[btAddressHex] = percent;
         }
+        _fallbackSinglePadBattery = percent;
+    }
+
+    private int? GetEffectiveBattery(BluetoothDeviceEntry dev)
+    {
+        if (_hidBatteryCache.TryGetValue(dev.AddressHex, out int hidBat)) return hidBat;
+        if (dev.BatteryPercent.HasValue) return dev.BatteryPercent.Value;
+        if (_cachedConnectedManaged.Count == 1 && _fallbackSinglePadBattery.HasValue)
+            return _fallbackSinglePadBattery.Value;
+        return null;
     }
 
     private bool IsDeviceManaged(BluetoothDeviceEntry dev)
@@ -115,6 +147,7 @@ public sealed class TrayAppContext : ApplicationContext
             _settings.EnabledDevices.Add(dev.AddressHex);
             _deviceLastInput[dev.AddressHex] = DateTime.UtcNow;
         }
+        _lastBtScanUtc = DateTime.MinValue;
         SaveSettings();
     }
 
@@ -154,7 +187,11 @@ public sealed class TrayAppContext : ApplicationContext
         {
             foreach (var dev in btDevices.OrderByDescending(d => d.IsConnected).ThenBy(d => d.Name))
             {
-                string statusTag = dev.IsConnected ? " [Connected]" : "";
+                int? bat = dev.IsConnected ? GetEffectiveBattery(dev) : null;
+                string statusTag = dev.IsConnected
+                    ? (bat.HasValue ? $" [Connected - {bat.Value}%]" : " [Connected]")
+                    : "";
+
                 var devItem = new ToolStripMenuItem($"{dev.Name}{statusTag}")
                 {
                     Checked = IsDeviceManaged(dev)
@@ -194,36 +231,78 @@ public sealed class TrayAppContext : ApplicationContext
             {
                 count++;
                 _deviceLastInput[dev.AddressHex] = now;
+                _hidBatteryCache.Remove(dev.AddressHex);
+                _fallbackSinglePadBattery = null;
             }
         }
+        _lastBtScanUtc = DateTime.MinValue;
         return count;
     }
 
-    private void CheckIdle()
+    private bool HasXInputActivity()
+    {
+        uint sum = 0;
+        for (uint i = 0; i < 4; i++)
+        {
+            if (XInputGetState(i, out var state) == 0)
+            {
+                sum += state.dwPacketNumber;
+            }
+        }
+
+        if (sum != _lastXInputPacketSum)
+        {
+            _lastXInputPacketSum = sum;
+            return true;
+        }
+        return false;
+    }
+
+    private void OnTick()
     {
         if (_settings.TimeoutMinutes <= 0) return;
 
         DateTime now = DateTime.UtcNow;
-        TimeSpan timeout = TimeSpan.FromMinutes(_settings.TimeoutMinutes);
-        var connectedManaged = NativeBluetooth.GetPairedDevices()
-            .Where(d => d.IsConnected && IsDeviceManaged(d))
-            .ToList();
 
-        if (connectedManaged.Count == 0)
+        if ((now - _lastBtScanUtc).TotalSeconds >= 5)
         {
-            UpdateTrayTooltipText(null);
+            _lastBtScanUtc = now;
+            _cachedConnectedManaged = NativeBluetooth.GetPairedDevices()
+                .Where(d => d.IsConnected && IsDeviceManaged(d))
+                .ToList();
+
+            var activeHexes = new HashSet<string>(_cachedConnectedManaged.Select(d => d.AddressHex), StringComparer.OrdinalIgnoreCase);
+            foreach (var staleKey in _deviceLastInput.Keys.Where(k => !activeHexes.Contains(k)).ToList())
+            {
+                _deviceLastInput.Remove(staleKey);
+                _hidBatteryCache.Remove(staleKey);
+            }
+
+            if (_cachedConnectedManaged.Count == 0)
+            {
+                _fallbackSinglePadBattery = null;
+            }
+        }
+
+        if (_cachedConnectedManaged.Count == 0)
+        {
+            UpdateTrayTooltipText(null, null);
             return;
         }
 
-        var activeHexes = new HashSet<string>(connectedManaged.Select(d => d.AddressHex), StringComparer.OrdinalIgnoreCase);
-        foreach (var staleKey in _deviceLastInput.Keys.Where(k => !activeHexes.Contains(k)).ToList())
+        if (HasXInputActivity())
         {
-            _deviceLastInput.Remove(staleKey);
+            foreach (var dev in _cachedConnectedManaged)
+            {
+                _deviceLastInput[dev.AddressHex] = now;
+            }
         }
 
+        TimeSpan timeout = TimeSpan.FromMinutes(_settings.TimeoutMinutes);
         TimeSpan? maxIdle = null;
+        int? displayBattery = null;
 
-        foreach (var dev in connectedManaged)
+        foreach (var dev in _cachedConnectedManaged)
         {
             if (!_deviceLastInput.TryGetValue(dev.AddressHex, out DateTime lastSeen))
             {
@@ -234,16 +313,25 @@ public sealed class TrayAppContext : ApplicationContext
             TimeSpan idle = now - lastSeen;
             if (maxIdle == null || idle > maxIdle) maxIdle = idle;
 
+            int? bat = GetEffectiveBattery(dev);
+            if (bat.HasValue && (displayBattery == null || bat.Value < displayBattery.Value))
+            {
+                displayBattery = bat.Value;
+            }
+
             if (idle >= timeout)
             {
                 if (NativeBluetooth.DisconnectDevice(dev.Address))
                 {
                     _deviceLastInput[dev.AddressHex] = now;
+                    _hidBatteryCache.Remove(dev.AddressHex);
+                    _fallbackSinglePadBattery = null;
+                    _lastBtScanUtc = DateTime.MinValue;
                 }
             }
         }
 
-        UpdateTrayTooltipText(maxIdle);
+        UpdateTrayTooltipText(maxIdle, displayBattery);
     }
 
     private void PromptCustomTimeout()
@@ -300,10 +388,10 @@ public sealed class TrayAppContext : ApplicationContext
         var oldIcon = _trayIcon.Icon;
         _trayIcon.Icon = TrayIconGenerator.CreateControllerIcon(enabled);
         oldIcon?.Dispose();
-        UpdateTrayTooltipText(null);
+        UpdateTrayTooltipText(null, null);
     }
 
-    private void UpdateTrayTooltipText(TimeSpan? currentIdle)
+    private void UpdateTrayTooltipText(TimeSpan? currentIdle, int? batteryPercent)
     {
         if (_settings.TimeoutMinutes <= 0)
         {
@@ -312,8 +400,8 @@ public sealed class TrayAppContext : ApplicationContext
         }
 
         string idlePart = currentIdle.HasValue ? $" | Idle: {(int)currentIdle.Value.TotalSeconds}s" : "";
-        string text = $"BT Auto-Off ({_settings.TimeoutMinutes}m){idlePart}";
-        // NotifyIcon.Text max length in Windows is 63 chars
+        string batPart = batteryPercent.HasValue ? $" | Bat: {batteryPercent.Value}%" : "";
+        string text = $"BT Auto-Off ({_settings.TimeoutMinutes}m){idlePart}{batPart}";
         _trayIcon.Text = text.Length > 63 ? text[..63] : text;
     }
 
@@ -356,12 +444,28 @@ public sealed class TrayAppContext : ApplicationContext
 
     private void ExitApp()
     {
-        _checkTimer.Stop();
+        _tickTimer.Stop();
         _trayIcon.Visible = false;
         _trayIcon.Icon?.Dispose();
         _listener.DestroyHandle();
         Application.Exit();
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XINPUT_STATE
+    {
+        public uint dwPacketNumber;
+        public ushort wButtons;
+        public byte bLeftTrigger;
+        public byte bRightTrigger;
+        public short sThumbLX;
+        public short sThumbLY;
+        public short sThumbRX;
+        public short sThumbRY;
+    }
+
+    [DllImport("xinput1_4.dll")]
+    private static extern uint XInputGetState(uint dwUserIndex, out XINPUT_STATE pState);
 }
 
 public sealed unsafe class RawInputListener : NativeWindow
@@ -372,33 +476,34 @@ public sealed unsafe class RawInputListener : NativeWindow
     private const uint RIDEV_INPUTSINK = 0x00000100;
     private const uint RIDEV_DEVNOTIFY = 0x00002000;
     private const uint RID_INPUT = 0x10000003;
-    private const uint RIDI_PREPARSEDDATA = 0x20000005;
     private const uint RIDI_DEVICENAME = 0x20000007;
     private const uint RIM_TYPEHID = 2;
-    private const uint HIDP_STATUS_SUCCESS = 0x00110000;
 
-    private static readonly Regex BtMacRegex = new(@"_([0-9A-Fa-f]{12})(?:#|&|$)", RegexOptions.Compiled);
+    private static readonly Regex BtMacRegex = new(@"(?:_|&|DEV_)([0-9A-Fa-f]{12})(?:#|&|$)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex BtColonMacRegex = new(@"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", RegexOptions.Compiled);
 
     private readonly Action<string?> _onActiveInput;
+    private readonly Action<string?, int> _onBatteryReport;
     private readonly Dictionary<IntPtr, HidDeviceState> _deviceStates = new();
 
     private sealed class HidDeviceState
     {
         public string? BtMac;
-        public byte[]? PreparsedData;
-        public ushort[] LastButtons = Array.Empty<ushort>();
-        public readonly Dictionary<ushort, uint> LastAxes = new();
+        public int LastBatteryPercent = -1;
+        public readonly Dictionary<byte, byte[]> LastPayloadByReportId = new();
     }
 
-    public RawInputListener(Action<string?> onActiveInput)
+    public RawInputListener(Action<string?> onActiveInput, Action<string?, int> onBatteryReport)
     {
         _onActiveInput = onActiveInput;
-        CreateHandle(new CreateParams());
+        _onBatteryReport = onBatteryReport;
+        CreateHandle(new CreateParams { Parent = new IntPtr(-3) });
 
         var devices = new[]
         {
             new RAWINPUTDEVICE { usUsagePage = 0x01, usUsage = 0x05, dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, hwndTarget = Handle },
-            new RAWINPUTDEVICE { usUsagePage = 0x01, usUsage = 0x04, dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, hwndTarget = Handle }
+            new RAWINPUTDEVICE { usUsagePage = 0x01, usUsage = 0x04, dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, hwndTarget = Handle },
+            new RAWINPUTDEVICE { usUsagePage = 0x01, usUsage = 0x08, dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, hwndTarget = Handle }
         };
 
         RegisterRawInputDevices(devices, (uint)devices.Length, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
@@ -431,31 +536,56 @@ public sealed unsafe class RawInputListener : NativeWindow
             if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, (IntPtr)nameBuf, ref charCount) > 0)
             {
                 string path = new(nameBuf);
-                if (path.Contains("BTHENUM", StringComparison.OrdinalIgnoreCase))
-                {
-                    var match = BtMacRegex.Match(path);
-                    if (match.Success)
-                        mac = match.Groups[1].Value.ToUpperInvariant();
-                }
+                mac = ResolveBluetoothMacFromPath(path);
             }
         }
 
-        byte[]? preparsed = null;
-        uint preparsedSize = 0;
-        GetRawInputDeviceInfo(hDevice, RIDI_PREPARSEDDATA, IntPtr.Zero, ref preparsedSize);
-        if (preparsedSize > 0 && preparsedSize < 65536)
-        {
-            preparsed = new byte[preparsedSize];
-            fixed (byte* pData = preparsed)
-            {
-                if (GetRawInputDeviceInfo(hDevice, RIDI_PREPARSEDDATA, (IntPtr)pData, ref preparsedSize) == uint.MaxValue)
-                    preparsed = null;
-            }
-        }
-
-        var state = new HidDeviceState { BtMac = mac, PreparsedData = preparsed };
+        var state = new HidDeviceState { BtMac = mac };
         _deviceStates[hDevice] = state;
         return state;
+    }
+
+    private static string? ExtractMac(string text)
+    {
+        var m1 = BtMacRegex.Match(text);
+        if (m1.Success) return m1.Groups[1].Value.ToUpperInvariant();
+
+        var m2 = BtColonMacRegex.Match(text);
+        if (m2.Success) return m2.Groups[1].Value.Replace(":", "").ToUpperInvariant();
+
+        return null;
+    }
+
+    private static string? ResolveBluetoothMacFromPath(string rawPath)
+    {
+        var direct = ExtractMac(rawPath);
+        if (direct != null) return direct;
+
+        string instanceId = rawPath;
+        if (instanceId.StartsWith(@"\\?\")) instanceId = instanceId[4..];
+        int guidIdx = instanceId.LastIndexOf("#{", StringComparison.Ordinal);
+        if (guidIdx > 0) instanceId = instanceId[..guidIdx];
+        instanceId = instanceId.Replace('#', '\\');
+
+        if (CM_Locate_DevNode(out uint devInst, instanceId, 0) == 0)
+        {
+            uint current = devInst;
+            char[] idBuf = new char[260];
+            for (int depth = 0; depth < 6; depth++)
+            {
+                if (CM_Get_Parent(out uint parent, current, 0) != 0) break;
+                Array.Clear(idBuf);
+                if (CM_Get_Device_ID(parent, idBuf, idBuf.Length, 0) == 0)
+                {
+                    string parentId = new string(idBuf).TrimEnd('\0');
+                    var parentMac = ExtractMac(parentId);
+                    if (parentMac != null) return parentMac;
+                }
+                current = parent;
+            }
+        }
+
+        return null;
     }
 
     private void ProcessRawInput(IntPtr hRawInput)
@@ -463,7 +593,7 @@ public sealed unsafe class RawInputListener : NativeWindow
         uint size = 0;
         uint headerSize = (uint)sizeof(RAWINPUTHEADER);
         GetRawInputData(hRawInput, RID_INPUT, IntPtr.Zero, ref size, headerSize);
-        if (size == 0 || size > 1024) return;
+        if (size == 0 || size > 2048) return;
 
         byte* buffer = stackalloc byte[(int)size];
         if (GetRawInputData(hRawInput, RID_INPUT, (IntPtr)buffer, ref size, headerSize) != size) return;
@@ -472,69 +602,71 @@ public sealed unsafe class RawInputListener : NativeWindow
         if (header->dwType != RIM_TYPEHID) return;
 
         var state = GetOrCreateState(header->hDevice);
-        // Ignore non-Bluetooth controllers completely
-        if (string.IsNullOrEmpty(state.BtMac) || state.PreparsedData == null) return;
 
         int rawHidOffset = (int)headerSize;
         uint dwSizeHid = *(uint*)(buffer + rawHidOffset);
         uint dwCount = *(uint*)(buffer + rawHidOffset + 4);
-        if (dwSizeHid == 0 || dwCount == 0) return;
+        if (dwSizeHid < 2 || dwCount == 0) return;
 
-        byte* reportPtr = buffer + rawHidOffset + 8;
+        byte* baseReportPtr = buffer + rawHidOffset + 8;
+        bool isExtendedBtReport = dwSizeHid >= 64;
+        int inspectLen = isExtendedBtReport ? 11 : (int)Math.Min(dwSizeHid - 1, 12);
 
-        fixed (byte* preparsedPtr = state.PreparsedData)
+        for (uint pkt = 0; pkt < dwCount; pkt++)
         {
-            // 1. Check standard Gamepad Button Page (0x09)
-            uint usageCount = 32;
-            ushort* usages = stackalloc ushort[32];
-            uint status = HidP_GetUsages(0, 0x09, 0, usages, ref usageCount, (IntPtr)preparsedPtr, (IntPtr)reportPtr, dwSizeHid);
-            if (status == HIDP_STATUS_SUCCESS)
+            byte* reportPtr = baseReportPtr + (pkt * dwSizeHid);
+            byte reportId = reportPtr[0];
+
+            // Extract battery directly from 78-byte DualSense (0x31, byte 53) or DS4 (0x11, byte 30) Bluetooth reports
+            if (dwSizeHid == 78)
             {
-                bool buttonsChanged = usageCount != state.LastButtons.Length;
-                if (!buttonsChanged)
+                int? sonyPct = null;
+                if (reportId == 0x31)
                 {
-                    for (int i = 0; i < usageCount; i++)
-                    {
-                        if (state.LastButtons[i] != usages[i])
-                        {
-                            buttonsChanged = true;
-                            break;
-                        }
-                    }
+                    int levelRaw = reportPtr[53] & 0x0F; // 0..10 scale
+                    sonyPct = Math.Min(100, levelRaw * 10 + 5);
+                }
+                else if (reportId == 0x11)
+                {
+                    int levelRaw = reportPtr[30] & 0x0F; // 0..10 scale
+                    sonyPct = Math.Min(100, levelRaw * 10 + 5);
                 }
 
-                if (buttonsChanged)
+                if (sonyPct.HasValue && sonyPct.Value != state.LastBatteryPercent)
                 {
-                    state.LastButtons = usageCount == 0 ? Array.Empty<ushort>() : new ushort[usageCount];
-                    for (int i = 0; i < usageCount; i++) state.LastButtons[i] = usages[i];
-                    _onActiveInput(state.BtMac);
-                    return;
+                    state.LastBatteryPercent = sonyPct.Value;
+                    _onBatteryReport(state.BtMac, sonyPct.Value);
                 }
             }
 
-            // 2. Check Generic Desktop analog axes (0x30=X, 0x31=Y, 0x32=Z, 0x33=Rx, 0x34=Ry, 0x35=Rz, 0x39=Hat/DPad)
-            ReadOnlySpan<ushort> axisUsages = [0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x39];
-            foreach (ushort usage in axisUsages)
+            if (!state.LastPayloadByReportId.TryGetValue(reportId, out byte[]? prev))
             {
-                if (HidP_GetUsageValue(0, 0x01, 0, usage, out uint val, (IntPtr)preparsedPtr, (IntPtr)reportPtr, dwSizeHid) == HIDP_STATUS_SUCCESS)
+                var initial = new byte[inspectLen];
+                for (int i = 0; i < inspectLen; i++) initial[i] = reportPtr[i + 1];
+                state.LastPayloadByReportId[reportId] = initial;
+                continue;
+            }
+
+            bool active = false;
+            for (int i = 0; i < inspectLen; i++)
+            {
+                if (isExtendedBtReport && (i == 0 || i == 7)) continue;
+
+                byte curr = reportPtr[i + 1];
+                int diff = Math.Abs(curr - prev[i]);
+                int threshold = (isExtendedBtReport && i >= 8) ? 0 : 14;
+                if (diff > threshold)
                 {
-                    if (!state.LastAxes.TryGetValue(usage, out uint prevVal))
-                    {
-                        state.LastAxes[usage] = val;
-                    }
-                    else
-                    {
-                        // Hat switch (0x39) is discrete; analog axes use a ~5% deadzone (3000 out of 65535, or 12 out of 255)
-                        uint threshold = usage == 0x39 ? 0u : (val > 255 || prevVal > 255 ? 3000u : 12u);
-                        long diff = Math.Abs((long)val - prevVal);
-                        if (diff > threshold)
-                        {
-                            state.LastAxes[usage] = val;
-                            _onActiveInput(state.BtMac);
-                            return;
-                        }
-                    }
+                    active = true;
+                    break;
                 }
+            }
+
+            if (active)
+            {
+                for (int i = 0; i < inspectLen; i++) prev[i] = reportPtr[i + 1];
+                _onActiveInput(state.BtMac);
+                return;
             }
         }
     }
@@ -566,20 +698,29 @@ public sealed unsafe class RawInputListener : NativeWindow
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetRawInputDeviceInfo(IntPtr hDevice, uint uiCommand, IntPtr pData, ref uint pcbSize);
 
-    [DllImport("hid.dll", SetLastError = true)]
-    private static extern uint HidP_GetUsages(
-        int ReportType, ushort UsagePage, ushort LinkCollection,
-        ushort* UsageList, ref uint UsageLength, IntPtr PreparsedData, IntPtr Report, uint ReportLength);
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Locate_DevNode(out uint pdnDevInst, string pDeviceID, uint ulFlags);
 
-    [DllImport("hid.dll", SetLastError = true)]
-    private static extern uint HidP_GetUsageValue(
-        int ReportType, ushort UsagePage, ushort LinkCollection, ushort Usage,
-        out uint UsageValue, IntPtr PreparsedData, IntPtr Report, uint ReportLength);
+    [DllImport("cfgmgr32.dll")]
+    private static extern int CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Device_ID(uint dnDevInst, char[] Buffer, int BufferLen, uint ulFlags);
 }
 
 public static class NativeBluetooth
 {
     private const uint IOCTL_BTH_DISCONNECT_DEVICE = 0x0041000C;
+    private const uint DIGCF_PRESENT = 0x00000002;
+    private const uint DIGCF_ALLCLASSES = 0x00000004;
+
+    private static DEVPROPKEY DEVPKEY_Device_BatteryLevel = new()
+    {
+        fmtid = new Guid("104EA319-6EE2-4701-BD47-8DDBF425BBE5"),
+        pid = 2
+    };
+
+    private static readonly Regex MacExtractRegex = new(@"(?:_|&|DEV_)([0-9A-Fa-f]{12})(?:#|&|$)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public static List<BluetoothDeviceEntry> GetPairedDevices()
     {
@@ -587,6 +728,8 @@ public static class NativeBluetooth
         var radioParams = new BLUETOOTH_FIND_RADIO_PARAMS { dwSize = Marshal.SizeOf<BLUETOOTH_FIND_RADIO_PARAMS>() };
         IntPtr hFindRadio = BluetoothFindFirstRadio(ref radioParams, out IntPtr hRadio);
         if (hFindRadio == IntPtr.Zero) return results;
+
+        Dictionary<string, int>? batteryByMac = null;
 
         try
         {
@@ -607,12 +750,24 @@ public static class NativeBluetooth
             {
                 do
                 {
+                    string hex = deviceInfo.Address.ToString("X12");
+                    int? battery = null;
+                    if (deviceInfo.fConnected)
+                    {
+                        batteryByMac ??= QueryPnpBluetoothBatteryLevels();
+                        if (batteryByMac.TryGetValue(hex, out int pct))
+                        {
+                            battery = pct;
+                        }
+                    }
+
                     results.Add(new BluetoothDeviceEntry
                     {
                         Address = deviceInfo.Address,
-                        Name = string.IsNullOrWhiteSpace(deviceInfo.szName) ? deviceInfo.Address.ToString("X12") : deviceInfo.szName,
+                        Name = string.IsNullOrWhiteSpace(deviceInfo.szName) ? hex : deviceInfo.szName,
                         ClassOfDevice = deviceInfo.ulClassofDevice,
-                        IsConnected = deviceInfo.fConnected
+                        IsConnected = deviceInfo.fConnected,
+                        BatteryPercent = battery
                     });
                 }
                 while (BluetoothFindNextDevice(hFindDevice, ref deviceInfo));
@@ -631,6 +786,55 @@ public static class NativeBluetooth
         return results;
     }
 
+    private static Dictionary<string, int> QueryPnpBluetoothBatteryLevels()
+    {
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        IntPtr devInfoSet = SetupDiGetClassDevs(IntPtr.Zero, null, IntPtr.Zero, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+        if (devInfoSet == IntPtr.Zero || devInfoSet == new IntPtr(-1)) return map;
+
+        try
+        {
+            var devData = new SP_DEVINFO_DATA { cbSize = Marshal.SizeOf<SP_DEVINFO_DATA>() };
+            char[] idBuf = new char[260];
+
+            for (uint idx = 0; SetupDiEnumDeviceInfo(devInfoSet, idx, ref devData); idx++)
+            {
+                if (!SetupDiGetDeviceProperty(devInfoSet, ref devData, ref DEVPKEY_Device_BatteryLevel,
+                    out uint propType, out byte batteryVal, 1, out _, 0))
+                {
+                    continue;
+                }
+
+                if (batteryVal > 100) continue;
+
+                uint current = devData.DevInst;
+                for (int depth = 0; depth < 6; depth++)
+                {
+                    Array.Clear(idBuf);
+                    if (CM_Get_Device_ID(current, idBuf, idBuf.Length, 0) == 0)
+                    {
+                        string id = new string(idBuf).TrimEnd('\0');
+                        var match = MacExtractRegex.Match(id);
+                        if (match.Success)
+                        {
+                            map[match.Groups[1].Value.ToUpperInvariant()] = batteryVal;
+                            break;
+                        }
+                    }
+
+                    if (CM_Get_Parent(out uint parent, current, 0) != 0) break;
+                    current = parent;
+                }
+            }
+        }
+        finally
+        {
+            SetupDiDestroyDeviceInfoList(devInfoSet);
+        }
+
+        return map;
+    }
+
     public static bool DisconnectDevice(ulong address)
     {
         var radioParams = new BLUETOOTH_FIND_RADIO_PARAMS { dwSize = Marshal.SizeOf<BLUETOOTH_FIND_RADIO_PARAMS>() };
@@ -646,6 +850,22 @@ public static class NativeBluetooth
             CloseHandle(hRadio);
             BluetoothFindRadioClose(hFindRadio);
         }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DEVPROPKEY
+    {
+        public Guid fmtid;
+        public uint pid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SP_DEVINFO_DATA
+    {
+        public int cbSize;
+        public Guid ClassGuid;
+        public uint DevInst;
+        public IntPtr Reserved;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -698,6 +918,26 @@ public static class NativeBluetooth
 
     [DllImport("BluetoothAPIs.dll", SetLastError = true)]
     private static extern bool BluetoothFindDeviceClose(IntPtr hFind);
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SetupDiGetClassDevs(IntPtr ClassGuid, string? Enumerator, IntPtr hwndParent, uint Flags);
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiEnumDeviceInfo(IntPtr DeviceInfoSet, uint MemberIndex, ref SP_DEVINFO_DATA DeviceInfoData);
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetupDiGetDeviceProperty(
+        IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref DEVPROPKEY PropertyKey,
+        out uint PropertyType, out byte PropertyBuffer, uint PropertyBufferSize, out uint RequiredSize, uint Flags);
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Device_ID(uint dnDevInst, char[] Buffer, int BufferLen, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern int CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
